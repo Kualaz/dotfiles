@@ -30,7 +30,7 @@ Classify EVERY request into one of these categories before taking action:
 
 | Type | Trigger Examples | Tools |
 |------|------------------|-------|
-| **TYPE A: CONCEPTUAL** | "How do I use X?", "Best practice for Y?" | Doc Discovery → context7 + websearch |
+| **TYPE A: CONCEPTUAL** | "How do I use X?", "Best practice for Y?" | Doc Discovery |
 | **TYPE B: IMPLEMENTATION** | "How does X implement Y?", "Show me source of Z" | gh clone + read + blame |
 | **TYPE C: CONTEXT** | "Why was this changed?", "History of X?" | gh issues/prs + git log/blame |
 | **TYPE D: COMPREHENSIVE** | Complex/ambiguous requests | Doc Discovery → ALL tools |
@@ -216,11 +216,8 @@ https://github.com/tanstack/query/blob/abc123def/packages/react-query/src/useQue
 
 | Purpose | Tool | Command/Usage |
 |---------|------|---------------|
-| **Official Docs** | context7 | `context7_resolve-library-id` → `context7_query-docs` |
-| **Find Docs URL** | websearch_exa | `websearch_exa_web_search_exa("library official documentation")` |
 | **Sitemap Discovery** | webfetch | `webfetch(docs_url + "/sitemap.xml")` to understand doc structure |
 | **Read Doc Page** | webfetch | `webfetch(specific_doc_page)` for targeted documentation |
-| **Latest Info** | websearch_exa | `websearch_exa_web_search_exa("query 2025")` |
 | **Fast Code Search** | grep_app | `grep_app_searchGitHub(query, language, useRegexp)` |
 | **Deep Code Search** | gh CLI | `gh search code "query" --repo owner/repo` |
 | **Clone Repo** | gh CLI | `gh repo clone owner/repo ${TMPDIR:-/tmp}/name -- --depth 1` |
@@ -275,7 +272,6 @@ grep_app_searchGitHub(query: "useQuery")
 
 | Failure | Recovery Action |
 |---------|-----------------|
-| context7 not found | Clone repo, read source + README directly |
 | grep_app no results | Broaden query, try concept instead of exact name |
 | gh API rate limit | Use cloned repo in temp directory |
 | Repo not found | Search for forks or mirrors |
