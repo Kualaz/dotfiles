@@ -12,8 +12,14 @@ return {
 			sockets_dir = "/tmp/pi-nvim-sockets",
 			latest_socket = "/tmp/pi-nvim-latest.sock",
 			request_timeout_ms = 5000,
+			events = true,
 			keymaps = true,
 		}
+
+		local event_client = nil
+		local event_socket_path = nil
+		local event_connecting = false
+		local event_buffer = ""
 
 		local function notify(message, level)
 			vim.notify(message, level or vim.log.levels.INFO, { title = "pi" })
@@ -170,6 +176,115 @@ return {
 		--- Send a raw JSON message to the Pi socket.
 		--- @param msg table
 		--- @param cb fun(err: string|nil, response: table|nil)|nil
+		local function close_event_client()
+			if event_client and not event_client:is_closing() then
+				pcall(function()
+					event_client:read_stop()
+				end)
+				event_client:close()
+			end
+			event_client = nil
+			event_socket_path = nil
+			event_connecting = false
+			event_buffer = ""
+		end
+
+		local function handle_bridge_event(payload)
+			if payload.event ~= "file.changed" then
+				return
+			end
+
+			vim.schedule(function()
+				pcall(vim.cmd, "checktime")
+			end)
+		end
+
+		function M.subscribe_events(opts)
+			opts = opts or {}
+			if not M.config.events then
+				return
+			end
+
+			local socket_path = M.get_socket_path({ quiet = true })
+			if not socket_path then
+				if not opts.quiet then
+					notify("No Pi session found for event subscription", vim.log.levels.WARN)
+				end
+				return
+			end
+
+			if opts.force then
+				close_event_client()
+			elseif event_client and event_socket_path == socket_path and not event_client:is_closing() then
+				return
+			elseif event_connecting then
+				return
+			else
+				close_event_client()
+			end
+
+			event_connecting = true
+			event_socket_path = socket_path
+			event_buffer = ""
+			event_client = uv.new_pipe(false)
+			if not event_client then
+				event_connecting = false
+				if not opts.quiet then
+					notify("Failed to create Pi event pipe", vim.log.levels.ERROR)
+				end
+				return
+			end
+
+			local client = event_client
+			client:connect(socket_path, function(connect_err)
+				if connect_err then
+					if event_client == client then
+						close_event_client()
+					end
+					if not opts.quiet then
+						notify("Failed to subscribe to Pi events: " .. connect_err, vim.log.levels.WARN)
+					end
+					return
+				end
+
+				if event_client ~= client then
+					return
+				end
+
+				event_connecting = false
+				client:write(vim.json.encode({ type = "subscribe", events = { "file.changed" } }) .. "\n")
+				client:read_start(function(read_err, data)
+					if read_err or not data then
+						if event_client == client then
+							close_event_client()
+						end
+						return
+					end
+
+					event_buffer = event_buffer .. data
+					while true do
+						local newline = event_buffer:find("\n", 1, true)
+						if not newline then
+							break
+						end
+
+						local line = event_buffer:sub(1, newline - 1)
+						event_buffer = event_buffer:sub(newline + 1)
+						if line ~= "" then
+							local ok, payload = pcall(vim.json.decode, line)
+							if ok and payload then
+								if payload.type == "event" then
+									handle_bridge_event(payload)
+								elseif payload.ok == false and not opts.quiet then
+									notify("Pi event subscription failed: " .. (payload.error or "unknown"), vim.log.levels.WARN)
+								end
+							end
+						end
+					end
+				end)
+			end)
+		end
+
 		function M.send_raw(msg, cb)
 			local socket_path = M.get_socket_path({ quiet = true })
 			if not socket_path then
@@ -296,6 +411,7 @@ return {
 				end
 
 				M.config.socket_path = session.socket
+				M.subscribe_events({ force = true, quiet = true })
 				notify(string.format("Connected to Pi at %s [pid %s]", session.cwd, session.pid), vim.log.levels.INFO)
 			end)
 		end
@@ -306,6 +422,7 @@ return {
 				return
 			end
 
+			M.subscribe_events({ quiet = true })
 			M.send_raw({ type = "prompt", message = message }, handle_prompt_response)
 		end
 
@@ -372,47 +489,219 @@ return {
 			}
 		end
 
-		local function this_target(selection, file, line)
-			if selection then
-				local ref = line_reference(selection.file, selection.start_line, selection.end_line)
-				if not ref then
-					return nil
-				end
-				return string.format("%s\n\n%s", fenced_code(selection.ft, selection.text), ref)
-			end
-
-			return line_reference(file, line)
+		local function clean_prompt_text(text)
+			local cleaned = text:gsub("[ \t]+\n", "\n"):gsub("\n[ \t]+", "\n"):gsub("[ \t][ \t]+", " ")
+			return vim.fn.trim(cleaned)
 		end
 
-		local function expand_this_target(prompt_text, selection, file, line)
-			if not prompt_text:find("@this", 1, true) then
+		local function escape_pattern(text)
+			return text:gsub("([^%w])", "%%%1")
+		end
+
+		local function buffer_text(bufnr)
+			if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+				return nil
+			end
+			return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+		end
+
+		local severity_names = {
+			[vim.diagnostic.severity.ERROR] = "ERROR",
+			[vim.diagnostic.severity.WARN] = "WARN",
+			[vim.diagnostic.severity.INFO] = "INFO",
+			[vim.diagnostic.severity.HINT] = "HINT",
+		}
+
+		local targets = {
+			["@this"] = {
+				menu = function(ctx)
+					if ctx.mode == "selection" then
+						return "current visual selection"
+					end
+					if ctx.mode == "file" then
+						return "current file"
+					end
+					if ctx.mode == "none" then
+						return "not available in this prompt"
+					end
+					return "current line"
+				end,
+				info = function(ctx)
+					if ctx.mode == "selection" then
+						return "Selected text, then cwd-relative file and line range"
+					end
+					if ctx.mode == "file" then
+						return "Cwd-relative file reference"
+					end
+					return "Cwd-relative file and current line"
+				end,
+				render = function(ctx)
+					if ctx.mode == "selection" then
+						local selection = ctx.selection
+						if not selection then
+							return nil, "@this requires an active visual selection"
+						end
+
+						local ref = line_reference(selection.file, selection.start_line, selection.end_line)
+						if not ref then
+							return nil, "@this requires a file-backed buffer"
+						end
+
+						return string.format("%s\n\n%s", fenced_code(selection.ft, selection.text), ref)
+					end
+
+					if ctx.mode == "file" then
+						if not ctx.file or ctx.file == "" then
+							return nil, "@this requires a file-backed buffer"
+						end
+						return ctx.file
+					end
+
+					if ctx.mode == "none" then
+						return nil, "@this is not available for this prompt"
+					end
+
+					local ref = line_reference(ctx.file, ctx.line)
+					if not ref then
+						return nil, "@this requires a file-backed buffer"
+					end
+					return ref
+				end,
+			},
+			["@buffer"] = {
+				menu = function()
+					return "current buffer"
+				end,
+				info = function()
+					return "Buffer text, then cwd-relative file reference"
+				end,
+				render = function(ctx)
+					if not ctx.file or ctx.file == "" then
+						return nil, "@buffer requires a file-backed buffer"
+					end
+
+					local text = buffer_text(ctx.bufnr)
+					if not text or vim.fn.trim(text) == "" then
+						return nil, "@buffer requires a non-empty buffer"
+					end
+
+					return string.format("%s\n\n%s", fenced_code(ctx.ft, text), ctx.file)
+				end,
+			},
+			["@diagnostics"] = {
+				menu = function()
+					return "current buffer diagnostics"
+				end,
+				info = function()
+					return "Diagnostics for the current buffer"
+				end,
+				render = function(ctx)
+					local file = ctx.file or "(unnamed buffer)"
+					local diagnostics = vim.diagnostic.get(ctx.bufnr)
+					if #diagnostics == 0 then
+						return string.format("No diagnostics for %s", file)
+					end
+
+					table.sort(diagnostics, function(a, b)
+						if a.lnum ~= b.lnum then
+							return a.lnum < b.lnum
+						end
+						if a.col ~= b.col then
+							return a.col < b.col
+						end
+						return (a.severity or 99) < (b.severity or 99)
+					end)
+
+					local lines = {}
+					for _, diagnostic in ipairs(diagnostics) do
+						local severity = severity_names[diagnostic.severity] or "UNKNOWN"
+						local ref = line_reference(file, diagnostic.lnum + 1) or file
+						local message = tostring(diagnostic.message or ""):gsub("\n", " ")
+						table.insert(lines, string.format("- %s %s: %s", severity, ref, message))
+					end
+
+					return table.concat(lines, "\n")
+				end,
+			},
+		}
+
+		local target_order = { "@this", "@buffer", "@diagnostics" }
+
+		local function sorted_target_names()
+			local names = vim.tbl_keys(targets)
+			table.sort(names, function(a, b)
+				return #a > #b
+			end)
+			return names
+		end
+
+		local function render_prompt(prompt_text, ctx)
+			local found = {}
+			for _, name in ipairs(sorted_target_names()) do
+				local start = 1
+				while true do
+					local from, to = prompt_text:find(name, start, true)
+					if not from then
+						break
+					end
+					table.insert(found, { name = name, from = from })
+					start = to + 1
+				end
+			end
+
+			if #found == 0 then
 				return prompt_text, nil
 			end
 
-			local target = this_target(selection, file, line)
-			if not target then
-				return nil, "@this requires a file-backed buffer"
+			table.sort(found, function(a, b)
+				return a.from < b.from
+			end)
+
+			local cleaned_prompt = prompt_text
+			for _, name in ipairs(sorted_target_names()) do
+				cleaned_prompt = cleaned_prompt:gsub(escape_pattern(name), "")
+			end
+			cleaned_prompt = clean_prompt_text(cleaned_prompt)
+
+			local rendered = {}
+			local seen = {}
+			for _, item in ipairs(found) do
+				if not seen[item.name] then
+					seen[item.name] = true
+					local target = targets[item.name]
+					local output, err = target.render(ctx)
+					if err then
+						return nil, err
+					end
+					if output and output ~= "" then
+						table.insert(rendered, output)
+					end
+				end
 			end
 
-			-- Keep the sentence readable while appending the heavy context safely.
-			-- Example: "why does @this fail?" -> "why does this fail?"
-			local readable_prompt = prompt_text:gsub("@this", "this")
-			readable_prompt = readable_prompt:gsub("[ \t]+\n", "\n"):gsub("\n[ \t]+", "\n"):gsub("[ \t][ \t]+", " ")
-			readable_prompt = vim.fn.trim(readable_prompt)
-
-			if readable_prompt == "" then
-				return string.format("Context:\n%s", target), nil
+			local context = table.concat(rendered, "\n\n")
+			if cleaned_prompt == "" then
+				return string.format("Context:\n%s", context), nil
 			end
 
-			return string.format("%s\n\nContext:\n%s", readable_prompt, target), nil
+			return string.format("%s\n\nContext:\n%s", cleaned_prompt, context), nil
 		end
 
 		function M.ask(opts)
 			opts = opts or {}
 			local selection = opts.selection
+			local initial_text = opts.initial_text or ""
 			local source_buf = vim.api.nvim_get_current_buf()
 			local source_file = relative_file(source_buf)
 			local source_line = vim.api.nvim_win_get_cursor(0)[1]
+			local prompt_context = {
+				mode = opts.mode or (selection and "selection" or "line"),
+				bufnr = source_buf,
+				file = source_file,
+				line = source_line,
+				selection = selection,
+				ft = vim.bo[source_buf].filetype,
+			}
 
 			local width = math.min(72, math.floor(vim.o.columns * 0.55))
 			local max_input_height = 6
@@ -427,7 +716,7 @@ return {
 			local input_buf = vim.api.nvim_create_buf(false, true)
 			vim.bo[input_buf].buftype = "nofile"
 			vim.bo[input_buf].filetype = "pi-nvim-prompt"
-			vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "" })
+			vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { initial_text })
 
 			local previous_completeopt = vim.o.completeopt
 			vim.o.completeopt = "menuone,noinsert,noselect"
@@ -447,6 +736,7 @@ return {
 			})
 			vim.wo[input_win].winhl = "NormalFloat:Normal,FloatBorder:PiNvimBorder,FloatTitle:PiNvimTitle"
 			vim.wo[input_win].wrap = true
+			vim.api.nvim_win_set_cursor(input_win, { 1, #initial_text })
 
 			local function resize_input()
 				if not vim.api.nvim_win_is_valid(input_win) then
@@ -493,7 +783,7 @@ return {
 			local function send()
 				local lines = vim.api.nvim_buf_get_lines(input_buf, 0, -1, false)
 				local prompt_text = vim.fn.trim(table.concat(lines, "\n"))
-				local message, expand_error = expand_this_target(prompt_text, selection, source_file, source_line)
+				local message, expand_error = render_prompt(prompt_text, prompt_context)
 				close()
 
 				if expand_error then
@@ -509,14 +799,17 @@ return {
 			end
 
 			local function target_completion_items()
-				return {
-					{
-						word = "@this",
-						abbr = "@this",
-						menu = selection and "current visual selection" or "current line",
-						info = selection and "Selected text, then cwd-relative file and line range" or "Cwd-relative file and current line",
-					},
-				}
+				local items = {}
+				for _, name in ipairs(target_order) do
+					local target = targets[name]
+					table.insert(items, {
+						word = name,
+						abbr = name,
+						menu = target.menu(prompt_context),
+						info = target.info(prompt_context),
+					})
+				end
+				return items
 			end
 
 			local function complete_target()
@@ -571,20 +864,25 @@ return {
 		end
 
 		function M.send_all()
-			local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-			local content = table.concat(lines, "\n")
-			if vim.fn.trim(content) == "" then
-				notify("Current buffer is empty", vim.log.levels.WARN)
-				return
-			end
-
-			local file = relative_file(0) or "(unnamed buffer)"
-			local message = string.format("Buffer: %s\n\n%s", file, fenced_code(vim.bo.filetype, content))
-			M.send_prompt(message)
+			M.ask({
+				mode = "file",
+				initial_text = "@buffer ",
+			})
 		end
 
 		function M.setup(opts)
 			M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+
+			if M.config.events then
+				vim.defer_fn(function()
+					M.subscribe_events({ quiet = true })
+				end, 250)
+			end
+
+			vim.api.nvim_create_autocmd("VimLeavePre", {
+				once = true,
+				callback = close_event_client,
+			})
 
 			vim.api.nvim_create_user_command("Pi", function(args)
 				local selection = nil
@@ -596,7 +894,7 @@ return {
 
 			vim.api.nvim_create_user_command("PiSendAll", function()
 				M.send_all()
-			end, { desc = "Send current buffer to Pi" })
+			end, { desc = "Ask Pi with the current buffer" })
 
 			vim.api.nvim_create_user_command("PiSessions", function()
 				M.list_sessions()
@@ -604,14 +902,14 @@ return {
 
 			if M.config.keymaps then
 				vim.keymap.set("n", "<leader>aa", function()
-					M.ask()
+					M.ask({ initial_text = "@this " })
 				end, { desc = "Ask Pi (@this = current line)" })
 				vim.keymap.set("x", "<leader>aa", function()
-					M.ask({ selection = M.capture_selection() })
+					M.ask({ selection = M.capture_selection(), initial_text = "@this " })
 				end, { desc = "Ask Pi (@this = selection)" })
 				vim.keymap.set("n", "<leader>ab", function()
 					M.send_all()
-				end, { desc = "Send all to Pi" })
+				end, { desc = "Ask Pi with buffer" })
 				vim.keymap.set("n", "<leader>ap", function()
 					M.list_sessions()
 				end, { desc = "Pick Pi session" })
